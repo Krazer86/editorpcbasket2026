@@ -44,7 +44,7 @@ namespace Editor_PCBasket___Mou.ViewModels
 			{
 				if(!SetProperty(ref _jugador, value)) return;
 
-				var equipo = _databaseService.DataBase.GetEquipoOfJugador(Jugador);
+				var equipo = _databaseService.GetEquipoOfJugador(Jugador);
 
 				if (equipo == null) return;
 

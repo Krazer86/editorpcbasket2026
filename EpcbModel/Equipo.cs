@@ -89,12 +89,12 @@ namespace EpcbModel
 		}
 		public double MediaQuinteto
 		{
-			get { return Math.Round(Plantilla.Sum(j => j.Medias.MediaQuinteto) / (double)Plantilla.Count, 2); }
+			get { return Plantilla == null || Plantilla.Count == 0 ? 0 : Math.Round(Plantilla.Sum(j => j.Medias.MediaQuinteto) / (double)Plantilla.Count, 2); }
 		}
 
 		public double MediaPlantilla
 		{
-			get { return Math.Round(Plantilla.Sum(j => j.Medias.MediaPlantilla) / (double)Plantilla.Count, 2); }
+			get { return Plantilla == null || Plantilla.Count == 0 ? 0 : Math.Round(Plantilla.Sum(j => j.Medias.MediaPlantilla) / (double)Plantilla.Count, 2); }
 		}
 
 		private ObservableCollection<Jugador> _plantilla;

@@ -22,8 +22,6 @@ namespace EpcbModel
 		{
 			_dbContext.Dispose();
 			_dbContext = GetNew();
-
-			_dbContext.SaveChanges();
 		}
 
 		protected virtual TContext GetNew()
