@@ -185,7 +185,7 @@ namespace EpcbUtils
 			if (header != null)
 			{
 				var headers = header.SelectNodes("./th|./td");
-				if (headers == null) return null;
+				if (headers == null || headers.Count != cells.Count) return null;
 
 				var indexes = new[]
 				{
