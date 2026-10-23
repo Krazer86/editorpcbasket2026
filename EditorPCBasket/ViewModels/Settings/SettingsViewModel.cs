@@ -8,7 +8,6 @@ using Prism.Regions;
 using System;
 using System.IO;
 using System.Linq;
-using System.Threading;
 using System.Windows;
 using System.Windows.Threading;
 using static Editor_PCBasket___Mou.Config.NavigationEnums;
@@ -187,22 +186,16 @@ namespace Editor_PCBasket___Mou.ViewModels.Settings
 			return ManagerOk && DbcOk;
 		}
 
-		private void ExecuteGenerateDb()
+		private async void ExecuteGenerateDb()
 		{
 			Application.Current.Dispatcher.Invoke(new Action(() =>
 			{
 				DialogHelper.ShowWaitingDialog("Generando BBDD, espere por favor...");
 			}), DispatcherPriority.Send);
 
-			var thread = new Thread(GenerateDbThread);
-			thread.Start();
-		}
-
-		private void GenerateDbThread()
-		{
 			try
 			{
-				_databaseService.GenerateInitialDatabase();
+				await _databaseService.GenerateInitialDatabase();
 				DialogHelper.CloseDialog();
 				CheckDatabase();
 			}

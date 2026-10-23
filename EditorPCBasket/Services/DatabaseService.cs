@@ -84,12 +84,20 @@ namespace Editor_PCBasket___Mou.Services
 		{
 			lock (_databaseLock)
 			{
-				using (var transaction = _locator.Current.Database.BeginTransaction())
+				try
 				{
-					_locator.Current.Jugadores.RemoveRange(_locator.Current.Jugadores.ToList());
-					_locator.Current.Equipos.RemoveRange(_locator.Current.Equipos.ToList());
-					_locator.Current.SaveChanges();
-					transaction.Commit();
+					using (var transaction = _locator.Current.Database.BeginTransaction())
+					{
+						_locator.Current.Jugadores.RemoveRange(_locator.Current.Jugadores.ToList());
+						_locator.Current.Equipos.RemoveRange(_locator.Current.Equipos.ToList());
+						_locator.Current.SaveChanges();
+						transaction.Commit();
+					}
+				}
+				catch
+				{
+					_locator.Reset();
+					throw;
 				}
 
 				_locator.Reset();
