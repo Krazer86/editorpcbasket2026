@@ -5,6 +5,8 @@ using System;
 using System.Linq;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.Collections.Specialized;
+using System.ComponentModel;
 using System.Threading.Tasks;
 using System.Windows;
 
@@ -14,13 +16,16 @@ namespace Editor_PCBasket___Mou.Services
 	{
 		private readonly PcBasketDbLocator _locator;
 		private readonly object _databaseLock = new object();
+		private readonly BatchObservableCollection<Equipo> _teamsList = new BatchObservableCollection<Equipo>();
 
-		public ObservableCollection<Equipo> TeamsList { get; private set; }
+		public ObservableCollection<Equipo> TeamsList
+		{
+			get { return _teamsList; }
+		}
 
 		public DatabaseService()
 		{
 			_locator = new PcBasketDbLocator();
-			TeamsList = new ObservableCollection<Equipo>();
 			ReplaceTeamsList(GetTeams());
 		}
 
@@ -206,14 +211,7 @@ namespace Editor_PCBasket___Mou.Services
 		private void ReplaceTeamsList(IEnumerable<Equipo> teams)
 		{
 			var orderedTeams = teams.OrderBy(team => team.Puntero).ToList();
-			UpdateTeamsList(() =>
-			{
-				TeamsList.Clear();
-				foreach (var team in orderedTeams)
-				{
-					TeamsList.Add(team);
-				}
-			});
+			UpdateTeamsList(() => _teamsList.ReplaceAll(orderedTeams));
 		}
 
 		private void UpdateTeamsList(Action update)
@@ -226,6 +224,51 @@ namespace Editor_PCBasket___Mou.Services
 			else
 			{
 				dispatcher.Invoke(update);
+			}
+		}
+
+		private sealed class BatchObservableCollection<T> : ObservableCollection<T>
+		{
+			private bool _suppressNotifications;
+
+			public void ReplaceAll(IEnumerable<T> items)
+			{
+				var replacement = new List<T>(items);
+				CheckReentrancy();
+
+				_suppressNotifications = true;
+				try
+				{
+					Items.Clear();
+					foreach (var item in replacement)
+					{
+						Items.Add(item);
+					}
+				}
+				finally
+				{
+					_suppressNotifications = false;
+				}
+
+				OnPropertyChanged(new PropertyChangedEventArgs(nameof(Count)));
+				OnPropertyChanged(new PropertyChangedEventArgs("Item[]"));
+				OnCollectionChanged(new NotifyCollectionChangedEventArgs(NotifyCollectionChangedAction.Reset));
+			}
+
+			protected override void OnCollectionChanged(NotifyCollectionChangedEventArgs e)
+			{
+				if (!_suppressNotifications)
+				{
+					base.OnCollectionChanged(e);
+				}
+			}
+
+			protected override void OnPropertyChanged(PropertyChangedEventArgs e)
+			{
+				if (!_suppressNotifications)
+				{
+					base.OnPropertyChanged(e);
+				}
 			}
 		}
 
