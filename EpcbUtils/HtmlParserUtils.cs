@@ -1,8 +1,8 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Data.Entity;
 using System.Globalization;
 using System.Linq;
+using System.Text.RegularExpressions;
 using EpcbModel;
 using HtmlAgilityPack;
 
@@ -10,18 +10,33 @@ namespace EpcbUtils
 {
 	public static class HtmlParserUtils
 	{
-		private static Random _rnd = new Random(DateTime.Now.Millisecond);
-		private static List<int> _dorsales = Enumerable.Range(0, 99).OrderBy(g => Guid.NewGuid()).ToList();
+		private static readonly object RandomLock = new object();
+		private static readonly Random Random = new Random();
+		private static readonly object DorsalLock = new object();
+		private static readonly List<int> Dorsales = Enumerable.Range(0, 100).OrderBy(g => Guid.NewGuid()).ToList();
 		private static int _i = 0;
 
 		public static int MaxPlayers { get; set; }
 
 		public static Equipo GetEquipoFromHtml(string url, int pEquipo, int pJugador, bool generatePhotos, bool generateEscudos, int desiredRating = -1)
 		{
+			if (MaxPlayers <= 0)
+			{
+				throw new InvalidOperationException("El número máximo de jugadores debe ser mayor que cero.");
+			}
+			if (desiredRating > 0 && (desiredRating < 11 || desiredRating > 95))
+			{
+				throw new ArgumentOutOfRangeException("desiredRating", "La media deseada debe estar entre 11 y 95.");
+			}
+
 			url = PrepareUrl(url);
 
 			var web = new HtmlWeb();
 			var doc = web.Load(url);
+			if (doc == null || doc.DocumentNode == null)
+			{
+				throw new InvalidOperationException("Proballers no devolvió contenido HTML para la URL indicada.");
+			}
 
 			var equipoRes = new Equipo
 			{
@@ -30,105 +45,95 @@ namespace EpcbUtils
 
 			LoggerUtils.LogString(string.Format("[PARSER] Generating team from Proballers with url {0}", url));
 
-			if (generateEscudos)
+			var identityImage = FindIdentityImage(doc);
+			var nombreEquipo = GetAttribute(identityImage, "alt");
+			if (string.IsNullOrWhiteSpace(nombreEquipo))
 			{
-				var escudo = doc.DocumentNode.SelectSingleNode("//span[@class='identity__picture__box']").SelectSingleNode("img").Attributes["src"].Value;
-				PhotoUtils.CreateEscudos(escudo, pEquipo);
+				nombreEquipo = GetText(doc.DocumentNode.SelectSingleNode("//h1"));
+			}
+			if (string.IsNullOrWhiteSpace(nombreEquipo))
+			{
+				throw new InvalidOperationException("No se encontró el nombre del equipo en la página de Proballers.");
 			}
 
-			var nombreEquipo = doc.DocumentNode.SelectSingleNode("//span[@class='identity__picture__box']").SelectSingleNode("img").Attributes["alt"].Value;
+			if (generateEscudos)
+			{
+				var escudo = GetAttribute(identityImage, "src");
+				if (!string.IsNullOrWhiteSpace(escudo))
+				{
+					PhotoUtils.CreateEscudos(new Uri(new Uri(url), escudo).AbsoluteUri, pEquipo);
+				}
+			}
 
 			equipoRes.NombreCorto = nombreEquipo;
 			equipoRes.NombreLargo = nombreEquipo;
 
-			var hPais = doc.DocumentNode.SelectSingleNode("//a[@class='breadcrumb-link']").Attributes["title"].Value;
-
-			var pais = CountryToPais(hPais);
-
-			equipoRes.Pais = pais;
-
-			var eqInfo = doc.DocumentNode.SelectSingleNode("//div[@class='table__inner']");
-			var plantilla = eqInfo.SelectSingleNode("//table[@class='table']").SelectSingleNode("//tbody");
+			var countryNode = doc.DocumentNode.SelectSingleNode("//*[contains(concat(' ', normalize-space(@class), ' '), ' breadcrumb-link ')]");
+			var hPais = GetAttribute(countryNode, "title");
+			equipoRes.Pais = CountryToPais(string.IsNullOrWhiteSpace(hPais) ? GetText(countryNode) : hPais);
 
 			var punteroJug = pJugador;
-
 			var teamStatistics = new Dictionary<int, PlayerStatistics>();
-
-			foreach (var jugador in plantilla.SelectNodes("//tr"))
+			var rosterRows = doc.DocumentNode.SelectNodes("//table//tbody/tr");
+			if (rosterRows == null || rosterRows.Count == 0)
 			{
-				var jugNode = jugador.Descendants().ElementAt(3);
-				var nombre = jugNode.InnerText;
+				throw new InvalidOperationException("No se encontró ninguna plantilla de jugadores en la página del equipo.");
+			}
 
-				if (nombre.StartsWith("\n") && nombre.Length < 23) continue;
+			foreach (var jugador in rosterRows)
+			{
+				var playerLink = jugador.SelectSingleNode(".//a[contains(@href, '/player/')]");
+				if (playerLink == null) continue;
 
-				nombre = nombre.Replace("\n", "");
-				nombre = nombre.Replace("  ", "");
-
-				var surname = nombre.Substring(nombre.IndexOf(' ') + 1).ToUpper();
-				var name = nombre.Substring(0, nombre.IndexOf(' '));
-
-				var completeName = string.Format("{0} {1}", name, surname);
-				if (equipoRes.Plantilla.Any(j => j.NombreLargo.Equals(completeName)))
+				var playerUrl = GetAttribute(playerLink, "href");
+				var nombre = GetText(playerLink);
+				if (string.IsNullOrWhiteSpace(nombre))
 				{
-					break;
+					nombre = GetAttribute(playerLink.SelectSingleNode(".//img"), "alt");
 				}
+				nombre = NormalizeText(nombre);
+				if (string.IsNullOrWhiteSpace(nombre)) continue;
 
-				var urlJug = jugNode.ParentNode.ChildNodes[1].Attributes[1].Value;
-
-				PlayerStatistics playerStatistics;
-
-				if (desiredRating > 0)
+				var nombreCompleto = NormalizeName(nombre);
+				if (equipoRes.Plantilla.Any(j => string.Equals(j.NombreLargo, nombreCompleto, StringComparison.OrdinalIgnoreCase)))
 				{
-					try
-					{
-						if (equipoRes.Plantilla.Count(j => j.NombreLargo.StartsWith(nombre.Substring(0, nombre.IndexOf(" ")))) < 1)
-						{
-							playerStatistics = new PlayerStatistics()
-							{
-								Points = double.Parse(jugador.Descendants("td").ElementAt(3).InnerText.Replace(".", CultureInfo.CurrentCulture.NumberFormat.NumberDecimalSeparator).Replace("-", "0")),
-								Rebounds = double.Parse(jugador.Descendants("td").ElementAt(4).InnerText.Replace(".", CultureInfo.CurrentCulture.NumberFormat.NumberDecimalSeparator).Replace("-", "0")),
-								Assists = double.Parse(jugador.Descendants("td").ElementAt(5).InnerText.Replace(".", CultureInfo.CurrentCulture.NumberFormat.NumberDecimalSeparator).Replace("-", "0")),
-								Minutes = double.Parse(jugador.Descendants("td").ElementAt(8).InnerText.Replace(".", CultureInfo.CurrentCulture.NumberFormat.NumberDecimalSeparator).Replace("-", "0")),
-								Pct3Pointers = double.Parse(jugador.Descendants("td").ElementAt(9).InnerText.Replace("%", "").Replace(".", CultureInfo.CurrentCulture.NumberFormat.NumberDecimalSeparator).Replace("-", "0")) / 100,
-								PctFieldGoalds = double.Parse(jugador.Descendants("td").ElementAt(10).InnerText.Replace("%", "").Replace(".", CultureInfo.CurrentCulture.NumberFormat.NumberDecimalSeparator).Replace("-", "35")) / 100,
-								PctFreeThrows = double.Parse(jugador.Descendants("td").ElementAt(11).InnerText.Replace("%", "").Replace(".", CultureInfo.CurrentCulture.NumberFormat.NumberDecimalSeparator).Replace("-", "60")) / 100,
-								OffensiveRebounds = double.Parse(jugador.Descendants("td").ElementAt(12).InnerText.Replace(".", CultureInfo.CurrentCulture.NumberFormat.NumberDecimalSeparator).Replace("-", "0")),
-								Steals = double.Parse(jugador.Descendants("td").ElementAt(15).InnerText.Replace(".", CultureInfo.CurrentCulture.NumberFormat.NumberDecimalSeparator).Replace("-", "0")),
-								TurnOvers = double.Parse(jugador.Descendants("td").ElementAt(16).InnerText.Replace(".", CultureInfo.CurrentCulture.NumberFormat.NumberDecimalSeparator).Replace("-", "0")),
-								Blocks = double.Parse(jugador.Descendants("td").ElementAt(17).InnerText.Replace(".", CultureInfo.CurrentCulture.NumberFormat.NumberDecimalSeparator).Replace("-", "0")),
-								Fouls = double.Parse(jugador.Descendants("td").ElementAt(18).InnerText.Replace(".", CultureInfo.CurrentCulture.NumberFormat.NumberDecimalSeparator).Replace("-", "0")),
-								Efficiency = double.Parse(jugador.Descendants("td").ElementAt(20).InnerText.Replace(".", CultureInfo.CurrentCulture.NumberFormat.NumberDecimalSeparator).Replace("-", "0")),
-								HighestPoints = double.Parse(jugador.Descendants("td").ElementAt(21).InnerText.Replace(".", CultureInfo.CurrentCulture.NumberFormat.NumberDecimalSeparator).Replace("-", "0")),
-								HighestRebounds = double.Parse(jugador.Descendants("td").ElementAt(22).InnerText.Replace(".", CultureInfo.CurrentCulture.NumberFormat.NumberDecimalSeparator).Replace("-", "0")),
-								HighestAssists = double.Parse(jugador.Descendants("td").ElementAt(23).InnerText.Replace(".", CultureInfo.CurrentCulture.NumberFormat.NumberDecimalSeparator).Replace("-", "0")),
-							};
-
-							teamStatistics.Add(punteroJug, playerStatistics);
-						}
-					}
-					catch (Exception ex)
-					{
-						LoggerUtils.LogException(ex);
-					}
+					continue;
 				}
 
 				try
 				{
-					var jug = GetJugadorFromUrl(urlJug, punteroJug, generatePhotos);
-
-					equipoRes.Plantilla.Add(jug);
+					var player = GetJugadorFromUrl(playerUrl, punteroJug, generatePhotos);
+					if (string.IsNullOrWhiteSpace(player.NombreLargo)) continue;
+					if (desiredRating > 0)
+					{
+						var statistics = TryReadStatistics(jugador);
+						if (statistics != null)
+						{
+							teamStatistics[punteroJug] = statistics;
+						}
+					}
+					equipoRes.Plantilla.Add(player);
 					punteroJug++;
 				}
 				catch (Exception ex)
 				{
-					LoggerUtils.LogException(ex);
+					LoggerUtils.LogString(string.Format("[PARSER] No se pudo importar el jugador '{0}': {1}", nombre, ex.Message));
 				}
 
-				if (equipoRes.Plantilla.Count >= MaxPlayers) break;
+				if (MaxPlayers > 0 && equipoRes.Plantilla.Count >= MaxPlayers) break;
+			}
+
+			if (equipoRes.Plantilla.Count == 0)
+			{
+				throw new InvalidOperationException("No se pudo importar ningún jugador. Puede que Proballers haya cambiado la página o que esta no tenga plantilla.");
 			}
 
 			if (desiredRating > 0)
 			{
+				if (teamStatistics.Count == 0)
+				{
+					throw new InvalidOperationException("No se encontraron estadísticas compatibles para generar las medias automáticamente.");
+				}
 				RatingsUtils.GenerateTeamRatings(equipoRes.Plantilla, teamStatistics, desiredRating);
 			}
 
@@ -137,133 +142,294 @@ namespace EpcbUtils
 			return equipoRes;
 		}
 
-		private static string PrepareUrl(string url)
+		private static HtmlNode FindIdentityImage(HtmlDocument document)
 		{
-			if (url.Contains("/es/"))
+			var identity = document.DocumentNode.SelectSingleNode(
+				"//*[contains(concat(' ', normalize-space(@class), ' '), ' identity__picture__box ')]");
+			if (identity == null) return null;
+
+			return identity.Name.Equals("img", StringComparison.OrdinalIgnoreCase)
+				? identity
+				: identity.SelectSingleNode(".//img");
+		}
+
+		private static string GetAttribute(HtmlNode node, string name)
+		{
+			return node == null || node.Attributes[name] == null
+				? null
+				: HtmlEntity.DeEntitize(node.Attributes[name].Value).Trim();
+		}
+
+		private static string GetText(HtmlNode node)
+		{
+			return node == null ? string.Empty : NormalizeText(node.InnerText);
+		}
+
+		private static string NormalizeText(string text)
+		{
+			return Regex.Replace(HtmlEntity.DeEntitize(text ?? string.Empty), @"\s+", " ").Trim();
+		}
+
+		private static string NormalizeName(string name)
+		{
+			return NormalizeText(name);
+		}
+
+		private static PlayerStatistics TryReadStatistics(HtmlNode row)
+		{
+			var cells = row.SelectNodes("./td");
+			if (cells == null || cells.Count == 0) return null;
+
+			var table = row.ParentNode == null ? null : row.ParentNode.ParentNode;
+			var header = table == null ? null : table.SelectSingleNode("./thead/tr[last()]");
+			if (header != null)
 			{
-				return url.Replace("/es/", "/").Replace("baloncesto", "basketball").Replace("equipo", "team");
-			}
-			if (url.Contains("/it/"))
-			{
-				return url.Replace("/it/", "/").Replace("pallacanestro", "basketball").Replace("squadra", "team");
-			}
-			if (url.Contains("/fr/"))
-			{
-				return url.Replace("/fr/", "/").Replace("equipe", "team");
+				var headers = header.SelectNodes("./th|./td");
+				if (headers == null) return null;
+
+				var indexes = new[]
+				{
+					FindStatisticColumn(headers, "pts", "points"),
+					FindStatisticColumn(headers, "reb", "rebs", "rebounds"),
+					FindStatisticColumn(headers, "ast", "assists"),
+					FindStatisticColumn(headers, "min", "minutes"),
+					FindStatisticColumn(headers, "3p", "3pt", "threepoint", "3points"),
+					FindStatisticColumn(headers, "fg", "fieldgoal"),
+					FindStatisticColumn(headers, "ft", "freethrow"),
+					FindStatisticColumn(headers, "orb", "offreb", "offensiverebound"),
+					FindStatisticColumn(headers, "stl", "steals"),
+					FindStatisticColumn(headers, "to", "turnover"),
+					FindStatisticColumn(headers, "blk", "blocks"),
+					FindStatisticColumn(headers, "pf", "fouls"),
+					FindStatisticColumn(headers, "eff", "efficiency"),
+					FindStatisticColumn(headers, "highpts", "maxpts", "ptsmax"),
+					FindStatisticColumn(headers, "highreb", "maxreb", "rebmax"),
+					FindStatisticColumn(headers, "highast", "maxast", "astmax")
+				};
+				if (indexes.Any(index => index < 0 || index >= cells.Count)) return null;
+
+				return CreateStatistics(cells, indexes);
 			}
 
-			return url;
+			if (cells.Count < 24) return null;
+			return CreateStatistics(cells, new[] { 3, 4, 5, 8, 9, 10, 11, 12, 15, 16, 17, 18, 20, 21, 22, 23 });
+		}
+
+		private static int FindStatisticColumn(HtmlNodeCollection headers, params string[] aliases)
+		{
+			for (var index = 0; index < headers.Count; index++)
+			{
+				var heading = NormalizeHeader(GetText(headers[index]));
+				if (aliases.Contains(heading)) return index;
+			}
+
+			for (var index = 0; index < headers.Count; index++)
+			{
+				var heading = NormalizeHeader(GetText(headers[index]));
+				if (aliases.Any(alias => heading == alias ||
+					(alias.Length > 2 && (heading.StartsWith(alias) || heading.EndsWith(alias)))))
+				{
+					return index;
+				}
+			}
+			return -1;
+		}
+
+		private static string NormalizeHeader(string header)
+		{
+			return Regex.Replace(header.ToLowerInvariant(), @"[^a-z0-9]", string.Empty);
+		}
+
+		private static PlayerStatistics CreateStatistics(HtmlNodeCollection cells, int[] indexes)
+		{
+			return new PlayerStatistics
+			{
+				Points = ReadStatistic(cells, indexes[0], 0),
+				Rebounds = ReadStatistic(cells, indexes[1], 0),
+				Assists = ReadStatistic(cells, indexes[2], 0),
+				Minutes = ReadStatistic(cells, indexes[3], 0),
+				Pct3Pointers = ReadStatistic(cells, indexes[4], 0, true),
+				PctFieldGoalds = ReadStatistic(cells, indexes[5], 35, true),
+				PctFreeThrows = ReadStatistic(cells, indexes[6], 60, true),
+				OffensiveRebounds = ReadStatistic(cells, indexes[7], 0),
+				Steals = ReadStatistic(cells, indexes[8], 0),
+				TurnOvers = ReadStatistic(cells, indexes[9], 0),
+				Blocks = ReadStatistic(cells, indexes[10], 0),
+				Fouls = ReadStatistic(cells, indexes[11], 0),
+				Efficiency = ReadStatistic(cells, indexes[12], 0),
+				HighestPoints = ReadStatistic(cells, indexes[13], 0),
+				HighestRebounds = ReadStatistic(cells, indexes[14], 0),
+				HighestAssists = ReadStatistic(cells, indexes[15], 0)
+			};
+		}
+
+		private static double ReadStatistic(HtmlNodeCollection cells, int index, double defaultValue, bool percentage = false)
+		{
+			var value = GetText(cells[index]);
+			if (percentage) value = value.Replace("%", string.Empty);
+			if (string.IsNullOrWhiteSpace(value) || value == "-") return defaultValue;
+
+			double result;
+			return double.TryParse(value.Replace(',', '.'), NumberStyles.Float, CultureInfo.InvariantCulture, out result)
+				? result / (percentage ? 100 : 1)
+				: defaultValue;
+		}
+
+		private static Pais FindNationality(string biography)
+		{
+			var normalizedBiography = NormalizeHeader(biography);
+			foreach (var country in CountryCodes.OrderByDescending(item => item.Key.Length))
+			{
+				if (normalizedBiography.Contains(NormalizeHeader(country.Key)))
+				{
+					return (Pais)country.Value;
+				}
+			}
+
+			return Pais.LUXEMBURGO;
+		}
+
+		private static string PrepareUrl(string url)
+		{
+			if (string.IsNullOrWhiteSpace(url))
+			{
+				throw new ArgumentException("Introduce una URL de equipo de Proballers.", "url");
+			}
+
+			Uri uri;
+			if (!Uri.TryCreate(url, UriKind.Absolute, out uri))
+			{
+				var normalizedUrl = url.Trim();
+				if (normalizedUrl.StartsWith("www.proballers.com/", StringComparison.OrdinalIgnoreCase) ||
+					normalizedUrl.StartsWith("proballers.com/", StringComparison.OrdinalIgnoreCase))
+				{
+					normalizedUrl = "https://" + normalizedUrl;
+				}
+				else
+				{
+					normalizedUrl = "https://www.proballers.com/" + normalizedUrl.TrimStart('/');
+				}
+
+				if (!Uri.TryCreate(normalizedUrl, UriKind.Absolute, out uri))
+				{
+					throw new ArgumentException("La URL de Proballers no es válida.", "url");
+				}
+			}
+
+			if (uri.Scheme != Uri.UriSchemeHttps ||
+				!(string.Equals(uri.Host, "www.proballers.com", StringComparison.OrdinalIgnoreCase) ||
+				  string.Equals(uri.Host, "proballers.com", StringComparison.OrdinalIgnoreCase)))
+			{
+				throw new ArgumentException("Solo se admiten páginas HTTPS de proballers.com.", "url");
+			}
+
+			var builder = new UriBuilder(uri);
+			if (builder.Path.Contains("/es/"))
+			{
+				builder.Path = builder.Path.Replace("/es/", "/").Replace("baloncesto", "basketball").Replace("equipo", "team");
+			}
+			else if (builder.Path.Contains("/it/"))
+			{
+				builder.Path = builder.Path.Replace("/it/", "/").Replace("pallacanestro", "basketball").Replace("squadra", "team");
+			}
+			else if (builder.Path.Contains("/fr/"))
+			{
+				builder.Path = builder.Path.Replace("/fr/", "/").Replace("equipe", "team");
+			}
+
+			return builder.Uri.AbsoluteUri;
 		}
 
 		private static Jugador GetJugadorFromUrl(string url, int puntero, bool generatePhotos)
 		{
-			var jugPlantilla = new Jugador() { Puntero = puntero };
-
+			var profileUri = new Uri(new Uri("https://www.proballers.com/"), url);
+			if (profileUri.Scheme != Uri.UriSchemeHttps ||
+				!(string.Equals(profileUri.Host, "www.proballers.com", StringComparison.OrdinalIgnoreCase) ||
+				  string.Equals(profileUri.Host, "proballers.com", StringComparison.OrdinalIgnoreCase)))
+			{
+				throw new InvalidOperationException("El enlace del jugador no pertenece a proballers.com.");
+			}
 			var web = new HtmlWeb();
-			var doc = web.Load("https://www.proballers.com" + url);
+			var doc = web.Load(profileUri.AbsoluteUri);
+			if (doc == null || doc.DocumentNode == null)
+			{
+				throw new InvalidOperationException("Proballers no devolvió el perfil del jugador.");
+			}
 
-			// Nombre
-			var nombre = doc.DocumentNode.SelectSingleNode("//span[@class='identity__picture__box']").SelectSingleNode("img").Attributes["alt"].Value;
+			var nombre = GetAttribute(FindIdentityImage(doc), "alt");
+			if (string.IsNullOrWhiteSpace(nombre))
+			{
+				nombre = GetText(doc.DocumentNode.SelectSingleNode("//h1"));
+			}
+			nombre = NormalizeText(nombre);
+			if (string.IsNullOrWhiteSpace(nombre))
+			{
+				throw new InvalidOperationException("No se encontró el nombre del jugador en su perfil.");
+			}
 
-			var surname = nombre.Substring(nombre.IndexOf(' ') + 1).ToUpper();
-			var name = nombre.Substring(0, nombre.IndexOf(' '));
+			var jugPlantilla = new Jugador() { Puntero = puntero };
+			var nombreCompleto = NormalizeName(nombre);
+			var nameParts = nombreCompleto.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+			var name = nameParts[0];
+			var surname = nameParts.Length > 1
+				? string.Join(" ", nameParts.Skip(1)).ToUpperInvariant()
+				: nameParts[0].ToUpperInvariant();
 
 			jugPlantilla.NombreCorto = surname;
 			jugPlantilla.NombreLargo = string.Format("{0} {1}", name, surname);
 
-			var playerProfil = doc.DocumentNode.SelectSingleNode("//div[@class='identity__stats__profil']");
-			var biography = doc.DocumentNode.SelectSingleNode("//div[@class='banner__biography__content']").ChildNodes.ElementAt(3).InnerText;
+			var playerProfil = doc.DocumentNode.SelectSingleNode("//*[contains(concat(' ', normalize-space(@class), ' '), ' identity__stats__profil ')]");
+			var biographyNode = doc.DocumentNode.SelectSingleNode("//*[contains(concat(' ', normalize-space(@class), ' '), ' banner__biography__content ')]");
+			var profileText = NormalizeText(GetText(playerProfil) + " " + GetText(biographyNode));
 
-			// Fecha nacimiento
-			try
+			var birthMatch = Regex.Match(profileText, @"\b(?:19|20)\d{2}\b");
+			if (birthMatch.Success && int.TryParse(birthMatch.Value, out var birthYear))
 			{
-				var birth = playerProfil.ChildNodes.ElementAt(1).ChildNodes.ElementAt(3).InnerText.Replace("\n", "").Trim();
-				var fnac = birth.Substring(birth.IndexOf(",") + 2, 4);
-
-				jugPlantilla.AnoNacimiento = int.Parse(fnac);
+				jugPlantilla.AnoNacimiento = birthYear;
 			}
-			catch (Exception)
+			else
 			{
 				jugPlantilla.AnoNacimiento = DateTime.Now.Year - 25;
 			}
 
-			// Altura y peso 
-			try
+			var heightMatch = Regex.Match(profileText, @"(?<!\d)(?<meters>[12][.,]\d{1,2})\s*m\b|(?<!\d)(?<centimeters>1\d{2}|2\d{2})\s*cm\b", RegexOptions.IgnoreCase);
+			if (heightMatch.Success)
 			{
-
-				var height = playerProfil.ChildNodes.ElementAt(3).ChildNodes.ElementAt(3).InnerText.Replace("\n", "").Trim();
-				var alt = height.Substring(0, 4).Replace("m", "");
-
-				jugPlantilla.Altura = int.Parse(alt);
-				jugPlantilla.Peso = jugPlantilla.Altura - 100 + _rnd.Next(-5, 5);
-			}
-			catch (Exception)
-			{
-				jugPlantilla.Altura = 200;
-				jugPlantilla.Peso = 95;
-			}
-
-			// Nacionalidad
-			try
-			{
-				jugPlantilla.Nacionalidad = Pais.LUXEMBURGO;
-
-				foreach (var country in CountryCodes)
+				var centimeters = heightMatch.Groups["centimeters"].Success
+					? int.Parse(heightMatch.Groups["centimeters"].Value, CultureInfo.InvariantCulture)
+					: (int)Math.Round(double.Parse(heightMatch.Groups["meters"].Value.Replace(',', '.'), CultureInfo.InvariantCulture) * 100);
+				jugPlantilla.Altura = centimeters;
+				lock (RandomLock)
 				{
-					if (biography.Substring(0, biography.IndexOf('.')).Contains(country.Key))
-					{
-						jugPlantilla.Nacionalidad = (Pais)country.Value;
-						break;
-					}
-				}
-				//jugPlantilla.Nacionalidad = NationalityToPais(nacionalidad);
-
-				if (IsCotonou(jugPlantilla.Nacionalidad))
-				{
-					jugPlantilla.ColorPiel = true;
+					jugPlantilla.Peso = centimeters - 100 + Random.Next(-5, 5);
 				}
 			}
-			catch (Exception)
-			{
-				jugPlantilla.Nacionalidad = Pais.LUXEMBURGO;
-			}
 
-			// Posición
-			try
-			{
-				int pos = SearchPosition(biography);
-				jugPlantilla.Demarcacion = pos;
-			}
-			catch (Exception)
-			{
-				jugPlantilla.Demarcacion = 2;
-			}
+			jugPlantilla.Nacionalidad = FindNationality(profileText);
+			jugPlantilla.ColorPiel = IsCotonou(jugPlantilla.Nacionalidad);
+			jugPlantilla.Demarcacion = SearchPosition(profileText);
 
-			// Fotos
 			if (generatePhotos)
 			{
-				try
+				var photoUrl = GetAttribute(FindIdentityImage(doc), "src");
+				if (!string.IsNullOrWhiteSpace(photoUrl))
 				{
-					var foto = doc.DocumentNode.SelectSingleNode("//span[@class='identity__picture__box']").SelectSingleNode("img").Attributes["src"].Value;
-					PhotoUtils.CreatePhotos(foto, jugPlantilla);
-				}
-				catch (Exception ex)
-				{
-					LoggerUtils.LogException(ex);
+					PhotoUtils.CreatePhotos(new Uri(profileUri, photoUrl).AbsoluteUri, jugPlantilla);
 				}
 			}
 
-			// Dorsal
-			jugPlantilla.Dorsal = _dorsales[_i];
-			_i++;
-			_i %= 100;
+			lock (DorsalLock)
+			{
+				jugPlantilla.Dorsal = Dorsales[_i];
+				_i = (_i + 1) % Dorsales.Count;
+			}
 
 			return jugPlantilla;
 		}
 
 		private static int SearchPosition(string info)
 		{
-			info = info.ToLower();
+			info = info.ToLowerInvariant();
 			if (info.Contains("point guard"))
 			{
 				return 0;
@@ -308,9 +474,16 @@ namespace EpcbUtils
 
 		private static Pais CountryToPais(string country)
 		{
-			int pais;
-			CountryCodes.TryGetValue(country, out pais);
-			return pais == 0 ? Pais.LUXEMBURGO : (Pais)pais;
+			if (string.IsNullOrWhiteSpace(country)) return Pais.LUXEMBURGO;
+
+			foreach (var entry in CountryCodes)
+			{
+				if (string.Equals(entry.Key, country.Trim(), StringComparison.OrdinalIgnoreCase))
+				{
+					return (Pais)entry.Value;
+				}
+			}
+			return Pais.LUXEMBURGO;
 		}
 
 		private static Pais NationalityToPais(string country)

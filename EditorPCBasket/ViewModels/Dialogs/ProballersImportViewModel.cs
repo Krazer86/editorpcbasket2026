@@ -61,6 +61,9 @@ namespace Editor_PCBasket___Mou.ViewModels.Dialogs
 			{
 				DialogHelper.CloseDialog();
 				LoggerUtils.LogException(ex);
+				DialogHelper.ShowSimpleDialog(
+					"No se pudo importar el equipo desde Proballers: " + ex.Message,
+					title: "Error de importación");
 			}
 		}
 
