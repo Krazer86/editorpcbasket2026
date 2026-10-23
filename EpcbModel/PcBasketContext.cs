@@ -26,16 +26,12 @@ namespace EpcbModel
 
 		public ObservableCollection<Jugador> GetPlantillaOfEquipo(int punteroEquipo)
 		{
-			var lista = Jugadores.SqlQuery("SELECT * WHERE Equipo_EquipoId = " + punteroEquipo).ToList();
+			var plantilla = Equipos
+				.Where(e => e.EquipoId == punteroEquipo)
+				.SelectMany(e => e.Plantilla)
+				.ToList();
 
-			var plantilla = new ObservableCollection<Jugador>();
-
-			foreach (var jug in lista)
-			{
-				plantilla.Add(jug);
-			}
-
-			return plantilla;
+			return new ObservableCollection<Jugador>(plantilla);
 		}
 	}
 }

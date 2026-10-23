@@ -12,47 +12,62 @@ namespace Editor_PCBasket___Mou.Services
 {
 	public class DatabaseService : IDatabaseService
 	{
-		public PcBasketContext DataBase { get { return _locator.Current; } }
-
-		private PcBasketDbLocator _locator;
+		private readonly PcBasketDbLocator _locator;
+		private readonly object _databaseLock = new object();
 
 		public ObservableCollection<Equipo> TeamsList { get; private set; }
 
 		public DatabaseService()
 		{
 			_locator = new PcBasketDbLocator();
-			TeamsList = new ObservableCollection<Equipo>(GetTeams().ToList().OrderBy(e => e.Puntero));
+			TeamsList = new ObservableCollection<Equipo>();
+			ReplaceTeamsList(GetTeams());
 		}
 
 		#region DB Creation
 
 		public async Task GenerateInitialDatabase()
 		{
-			try
+			var teams = await Task.Run(ReadInitialTeams);
+			if (teams.Count == 0)
 			{
-				Reset();
-
-				var tcs = new TaskCompletionSource<List<Equipo>>(TaskCreationOptions.RunContinuationsAsynchronously);
-
-				await CreateTeams(tcs);
-				await tcs.Task;
-
-				DataBase.Equipos.AddRange(tcs.Task.Result);
-				DataBase.SaveChanges();
-
-				TeamsList = new ObservableCollection<Equipo>(GetTeams().ToList().OrderBy(e => e.Puntero));
+				throw new InvalidOperationException("No se han encontrado equipos válidos para importar.");
 			}
-			catch (Exception ex)
+
+			List<Equipo> importedTeams;
+			lock (_databaseLock)
 			{
-				LoggerUtils.LogException(ex);
+				try
+				{
+					using (var transaction = _locator.Current.Database.BeginTransaction())
+					{
+						_locator.Current.Jugadores.RemoveRange(_locator.Current.Jugadores.ToList());
+						_locator.Current.Equipos.RemoveRange(_locator.Current.Equipos.ToList());
+						_locator.Current.SaveChanges();
+
+						_locator.Current.Equipos.AddRange(teams);
+						_locator.Current.SaveChanges();
+						transaction.Commit();
+					}
+				}
+				catch
+				{
+					_locator.Reset();
+					throw;
+				}
+
+				importedTeams = LoadTeams();
 			}
+
+			ReplaceTeamsList(importedTeams);
 		}
 
-		public Task CreateTeams(TaskCompletionSource<List<Equipo>> teamList)
+		private List<Equipo> ReadInitialTeams()
 		{
 			var equiposList = new List<Equipo>();
+			var directory = Path.Combine(Properties.Settings.Default.Path, "DBDAT", "EQ022022");
 
-			foreach (var dbc in Directory.GetFiles(Properties.Settings.Default.Path + "\\DBDAT\\EQ022022"))
+			foreach (var dbc in Directory.GetFiles(directory, "*.dbc"))
 			{
 				using (var eqFile = File.OpenRead(dbc))
 				{
@@ -62,19 +77,25 @@ namespace Editor_PCBasket___Mou.Services
 				}
 			}
 
-			teamList.SetResult(equiposList);
-			return Task.CompletedTask;
+			return equiposList;
 		}
 
 		public void Reset()
 		{
-			_locator.Reset();
-			DataBase.Database.ExecuteSqlCommand("delete from Jugadores");
-			DataBase.Database.ExecuteSqlCommand("delete from Equipos");
+			lock (_databaseLock)
+			{
+				using (var transaction = _locator.Current.Database.BeginTransaction())
+				{
+					_locator.Current.Jugadores.RemoveRange(_locator.Current.Jugadores.ToList());
+					_locator.Current.Equipos.RemoveRange(_locator.Current.Equipos.ToList());
+					_locator.Current.SaveChanges();
+					transaction.Commit();
+				}
 
-			DataBase.SaveChanges();
+				_locator.Reset();
+			}
 
-			Application.Current.Dispatcher.Invoke(TeamsList.Clear);
+			UpdateTeamsList(new List<Equipo>());
 		}
 
 		#endregion
@@ -83,51 +104,81 @@ namespace Editor_PCBasket___Mou.Services
 
 		public Equipo GetTeam(int puntero)
 		{
-			var team = DataBase.GetEquipo(puntero);
-			return team;
+			lock (_databaseLock)
+			{
+				return _locator.Current.GetEquipo(puntero);
+			}
+		}
+
+		public Equipo GetEquipoOfJugador(Jugador jugador)
+		{
+			lock (_databaseLock)
+			{
+				return _locator.Current.GetEquipoOfJugador(jugador);
+			}
 		}
 
 		public IEnumerable<Equipo> GetTeams()
 		{
-			return DataBase.Equipos.Include("Plantilla").Where(e => e.Puntero > 0).ToList();
+			lock (_databaseLock)
+			{
+				return LoadTeams();
+			}
+		}
+
+		private List<Equipo> LoadTeams()
+		{
+			return _locator.Current.Equipos.Include("Plantilla")
+				.Where(e => e.Puntero > 0)
+				.OrderBy(e => e.Puntero)
+				.ToList();
 		}
 
 		public void DeleteTeam(Equipo team)
 		{
 			try
 			{
-				DataBase.Equipos.Remove(team);
-				DataBase.SaveChanges();
+				lock (_databaseLock)
+				{
+					_locator.Current.Equipos.Remove(team);
+					_locator.Current.SaveChanges();
+				}
 			}
 			catch (Exception ex)
 			{
 				LoggerUtils.LogException(ex);
+				return;
 			}
 
-			try
-			{
-				TeamsList.Remove(team);
-			}
-			catch (Exception ex)
-			{
-				LoggerUtils.LogException(ex);
-			}
+			UpdateTeamsList(() => TeamsList.Remove(team));
 		}
 
 		public void AddTeam(Equipo team)
 		{
-			if (!DataBase.Equipos.Where(p => p.Puntero == team.Puntero).Any())
+			var added = false;
+			lock (_databaseLock)
 			{
-				DataBase.Equipos.Add(team);
-				TeamsList.Add(team);
+				if (!_locator.Current.Equipos.Any(p => p.Puntero == team.Puntero))
+				{
+					_locator.Current.Equipos.Add(team);
+					added = true;
+				}
+
+				_locator.Current.SaveChanges();
 			}
 
-			DataBase.SaveChanges();
+			if (added)
+			{
+				UpdateTeamsList(() => TeamsList.Add(team));
+			}
 		}
 
 		public int GetNumberOfTeams()
 		{
-			return DataBase.Equipos.Count();
+			lock (_databaseLock)
+			{
+				return _locator.Current.Equipos.Count();
+			}
 		}
 
 		#endregion
@@ -136,9 +187,39 @@ namespace Editor_PCBasket___Mou.Services
 
 		public int GetNumberOfPlayers()
 		{
-			return DataBase.Jugadores.Count();
+			lock (_databaseLock)
+			{
+				return _locator.Current.Jugadores.Count();
+			}
 		}
 
 		#endregion
+
+		private void ReplaceTeamsList(IEnumerable<Equipo> teams)
+		{
+			var orderedTeams = teams.OrderBy(team => team.Puntero).ToList();
+			UpdateTeamsList(() =>
+			{
+				TeamsList.Clear();
+				foreach (var team in orderedTeams)
+				{
+					TeamsList.Add(team);
+				}
+			});
+		}
+
+		private void UpdateTeamsList(Action update)
+		{
+			var dispatcher = Application.Current.Dispatcher;
+			if (dispatcher.CheckAccess())
+			{
+				update();
+			}
+			else
+			{
+				dispatcher.Invoke(update);
+			}
+		}
+
 	}
 }

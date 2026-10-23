@@ -1,45 +1,52 @@
 ﻿using System;
+using System.Diagnostics;
 using System.IO;
-using System.Windows.Threading;
 
 namespace EpcbUtils
 {
 	public static class LoggerUtils
 	{
-		private static StreamWriter _logger;
+		private static readonly object SyncRoot = new object();
 
 		public static string LogFilePath { get; set; }
 
 		public static void LogException(Exception ex)
 		{
-			try
-			{
-				Dispatcher.CurrentDispatcher.Invoke(new Action(() =>
-				{
-					_logger = File.AppendText(LogFilePath);
-					_logger.WriteLine("[" + DateTime.Now.ToString() + "] " + ex.ToString());
-					_logger.Close();
-				}));
-			}
-			catch (Exception)
-			{
-
-			}
+			WriteLine(ex == null ? "Unknown exception" : ex.ToString());
 		}
 
 		public static void LogString(string str)
 		{
-			Dispatcher.CurrentDispatcher.Invoke(new Action(() =>
+			WriteLine(str);
+		}
+
+		private static void WriteLine(string message)
+		{
+			lock (SyncRoot)
 			{
-				_logger = File.AppendText(LogFilePath);
-				_logger.WriteLine("[" + DateTime.Now.ToString() + "] " + str);
-				_logger.Close();
-			}));
+				try
+				{
+					if (string.IsNullOrWhiteSpace(LogFilePath))
+					{
+						Trace.WriteLine(message);
+						return;
+					}
+
+					using (var logger = File.AppendText(LogFilePath))
+					{
+						logger.WriteLine("[{0}] {1}", DateTime.Now, message);
+					}
+				}
+				catch (Exception loggingException)
+				{
+					Trace.WriteLine(loggingException);
+					Trace.WriteLine(message);
+				}
+			}
 		}
 
 		public static void CloseLogger()
 		{
-			_logger.Close();
 		}
 	}
 }
